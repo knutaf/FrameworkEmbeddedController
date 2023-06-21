@@ -152,6 +152,16 @@ static int typematic_inter_delay;
 static int typematic_len;  /* length of typematic_scan_code */
 static uint8_t typematic_scan_code[MAX_SCAN_CODE_LEN];
 static timestamp_t typematic_deadline;
+
+// knutaf - added
+static enum scancode_set_list typematic_code_set;
+static uint16_t typematic_make_code;
+
+#ifdef CONFIG_KEYBOARD_TYPEMATIC_AUTO_CLEAR_DEADLINE
+static timestamp_t typematic_auto_clear_deadline;
+static int typematic_auto_clear_deadline_delay = 3000 * MSEC;
+#endif // CONFIG_KEYBOARD_TYPEMATIC_AUTO_CLEAR_DEADLINE
+
 #define KB_SYSJUMP_TAG 0x4b42  /* "KB" */
 #define KB_HOOK_VERSION 2
 /* the previous keyboard state before reboot_ec. */
@@ -347,7 +357,9 @@ static void scancode_bytes(uint16_t make_code, int8_t pressed,
 static enum ec_error_list matrix_callback(int8_t row, int8_t col,
 					  int8_t pressed,
 					  enum scancode_set_list code_set,
-					  uint8_t *scan_code, int32_t *len)
+					  uint8_t *scan_code, int32_t *len,
+                      enum scancode_set_list *used_code_set,
+                      uint16_t *made_code)
 {
 	uint16_t make_code;
 
@@ -378,6 +390,9 @@ static enum ec_error_list matrix_callback(int8_t row, int8_t col,
 		CPRINTS("KB scancode %d:%d missing", row, col);
 		return EC_ERROR_UNIMPLEMENTED;
 	}
+
+    *used_code_set = code_set;
+    *made_code = make_code;
 
 	scancode_bytes(make_code, pressed, code_set, scan_code, len);
 	return EC_SUCCESS;
@@ -421,6 +436,11 @@ static void keyboard_wakeup(void)
 static void set_typematic_key(const uint8_t *scan_code, int32_t len)
 {
 	typematic_deadline.val = get_time().val + typematic_first_delay;
+
+#ifdef CONFIG_KEYBOARD_TYPEMATIC_AUTO_CLEAR_DEADLINE
+    typematic_auto_clear_deadline.val = get_time().val + typematic_auto_clear_deadline_delay;
+#endif
+
 	memcpy(typematic_scan_code, scan_code, len);
 	typematic_len = len;
 }
@@ -434,6 +454,8 @@ void keyboard_state_changed(int row, int col, int is_pressed)
 {
 	uint8_t scan_code[MAX_SCAN_CODE_LEN];
 	int32_t len = 0;
+    enum scancode_set_list code_set;
+    uint16_t make_code;
 	enum ec_error_list ret;
 
 #ifdef CONFIG_KEYBOARD_DEBUG
@@ -447,19 +469,30 @@ void keyboard_state_changed(int row, int col, int is_pressed)
 #endif
 
 	ret = matrix_callback(row, col, is_pressed, scancode_set, scan_code,
-			      &len);
+			      &len, &code_set, &make_code);
 	if (ret == EC_SUCCESS) {
 		ASSERT(len > 0);
-		if (keystroke_enabled)
+		if (keystroke_enabled) {
 			i8042_send_to_host(len, scan_code, CHAN_KBD);
-	}
+        }
 
-	if (is_pressed) {
-		keyboard_wakeup();
-		set_typematic_key(scan_code, len);
-		task_wake(TASK_ID_KEYPROTO);
-	} else {
-		clear_typematic_key();
+        if (is_pressed) {
+            keyboard_wakeup();
+
+            set_typematic_key(scan_code, len);
+
+            // TODO knutaf: maybe encapsulate this in a function
+            typematic_code_set = code_set;
+            typematic_make_code = make_code;
+
+            task_wake(TASK_ID_KEYPROTO);
+        } else {
+            // Only clear typematic key if that is the key being released. This fixes an issue where if keys A and then B
+            // are both held down at the same time, and the user releases A, B will also stop repeating.
+            if (code_set == typematic_code_set && make_code == typematic_make_code) {
+                clear_typematic_key();
+            }
+        }
 	}
 }
 
@@ -913,7 +946,15 @@ void keyboard_protocol_task(void *u)
 			if (!typematic_len) {
 				/* Typematic disabled; wait for enable */
 				wait = -1;
-			} else if (timestamp_expired(typematic_deadline, &t)) {
+			}
+#ifdef CONFIG_KEYBOARD_TYPEMATIC_AUTO_CLEAR_DEADLINE
+            else if (timestamp_expired(typematic_auto_clear_deadline, &t)) {
+                // knutaf - added
+                clear_typematic_key();
+                wait = -1;
+			}
+#endif // CONFIG_KEYBOARD_TYPEMATIC_AUTO_CLEAR_DEADLINE
+            else if (timestamp_expired(typematic_deadline, &t)) {
 				/* Ready for next typematic keystroke */
 				if (keystroke_enabled)
 					i8042_send_to_host(typematic_len,
